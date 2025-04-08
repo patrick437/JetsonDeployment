@@ -8,25 +8,7 @@ from gi.repository import Gst, GLib
 # Initialize GStreamer
 Gst.init(None)
 
-# Simple pipeline for just displaying camera feed
-pipeline_str = (
-    "nvarguscamerasrc sensor-id=0 ! "
-    "video/x-raw(memory:NVMM), width=640, height=480, format=NV12, framerate=30/1 ! "
-    "nvvidconv ! "
-    "video/x-raw, format=BGRx ! "
-    "videoconvert ! "
-    "video/x-raw, format=BGR ! "
-    "appsink name=appsink emit-signals=true"
-)
-
-# Create and start pipeline
-pipeline = Gst.parse_launch(pipeline_str)
-appsink = pipeline.get_by_name('appsink')
-
-# Setup appsink callbacks
-appsink.set_property('emit-signals', True)
-appsink.connect('new-sample', on_new_sample)
-
+# Define callback function first
 def on_new_sample(appsink):
     sample = appsink.pull_sample()
     buffer = sample.get_buffer()
@@ -51,12 +33,32 @@ def on_new_sample(appsink):
     buffer.unmap(map_info)
     return Gst.FlowReturn.OK
 
+# Simple pipeline for just displaying camera feed
+pipeline_str = (
+    "nvarguscamerasrc sensor-id=0 ! "
+    "video/x-raw(memory:NVMM), width=640, height=480, format=NV12, framerate=30/1 ! "
+    "nvvidconv ! "
+    "video/x-raw, format=BGRx ! "
+    "videoconvert ! "
+    "video/x-raw, format=BGR ! "
+    "appsink name=appsink emit-signals=true"
+)
+
+# Create and start pipeline
+pipeline = Gst.parse_launch(pipeline_str)
+appsink = pipeline.get_by_name('appsink')
+
+# Setup appsink callbacks
+appsink.set_property('emit-signals', True)
+appsink.connect('new-sample', on_new_sample)
+
 # Start pipeline
 pipeline.set_state(Gst.State.PLAYING)
 
 # Create main loop
 loop = GLib.MainLoop()
 try:
+    print("Camera feed started. Press Ctrl+C to exit.")
     loop.run()
 except KeyboardInterrupt:
     pass
