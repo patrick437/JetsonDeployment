@@ -4,16 +4,17 @@ import cv2
 import time
 
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib
+gi.require_version('GstApp', '1.0')  # Add GstApp explicitly
+from gi.repository import Gst, GLib, GstApp  # Import GstApp
 
 # Initialize GStreamer
 Gst.init(None)
 
-# Define callback function first
+# Define callback function using emit instead of direct method call
 def on_new_sample(appsink):
     try:
         print("New sample callback triggered")
-        sample = appsink.pull_sample()
+        sample = appsink.emit("pull-sample")  # Use emit instead of pull_sample
         if not sample:
             print("No sample received")
             return Gst.FlowReturn.OK
@@ -51,33 +52,15 @@ def on_new_sample(appsink):
         print(f"Error in sample processing: {e}")
         return Gst.FlowReturn.ERROR
 
-# Define message handler
-def on_message(bus, message):
-    msg_type = message.type
-    if msg_type == Gst.MessageType.ERROR:
-        err, debug = message.parse_error()
-        print(f"Error: {err}, {debug}")
-        loop.quit()
-    elif msg_type == Gst.MessageType.WARNING:
-        warn, debug = message.parse_warning()
-        print(f"Warning: {warn}, {debug}")
-    elif msg_type == Gst.MessageType.EOS:
-        print("End of stream")
-        loop.quit()
-    elif msg_type == Gst.MessageType.STATE_CHANGED:
-        if message.src == pipeline:
-            old_state, new_state, pending_state = message.parse_state_changed()
-            print(f"Pipeline state changed from {Gst.Element.state_get_name(old_state)} to {Gst.Element.state_get_name(new_state)}")
-
-# Simple pipeline for just displaying camera feed
+# Simple pipeline - using a configuration closer to what worked on command line
 pipeline_str = (
-    "nvarguscamerasrc sensor-id=0 ! "
-    "video/x-raw(memory:NVMM), width=640, height=480, format=NV12, framerate=30/1 ! "
+    "nvarguscamerasrc ! "
+    "video/x-raw(memory:NVMM), width=640, height=480, format=NV12 ! "
     "nvvidconv ! "
     "video/x-raw, format=BGRx ! "
     "videoconvert ! "
     "video/x-raw, format=BGR ! "
-    "appsink name=appsink emit-signals=true sync=false drop=true"
+    "appsink name=appsink emit-signals=true"
 )
 
 print(f"Using pipeline: {pipeline_str}")
@@ -86,34 +69,14 @@ print(f"Using pipeline: {pipeline_str}")
 pipeline = Gst.parse_launch(pipeline_str)
 appsink = pipeline.get_by_name('appsink')
 
-if not appsink:
-    print("ERROR: Could not retrieve appsink element")
-    exit(1)
-
-# Setup message bus
-bus = pipeline.get_bus()
-bus.add_signal_watch()
-bus.connect("message", on_message)
-
 # Setup appsink callbacks
 appsink.set_property('emit-signals', True)
-appsink.set_property('sync', False)
-appsink.set_property('drop', True)
-appsink.set_property('max-buffers', 1)
 appsink.connect('new-sample', on_new_sample)
 
 # Start pipeline
 print("Setting pipeline to PLAYING state...")
 ret = pipeline.set_state(Gst.State.PLAYING)
 print(f"Pipeline state change result: {ret}")
-
-if ret == Gst.StateChangeReturn.FAILURE:
-    print("Failed to set pipeline to PLAYING state")
-    exit(1)
-
-# Give the camera time to initialize
-print("Waiting for camera to initialize...")
-time.sleep(2)
 
 # Create main loop
 loop = GLib.MainLoop()
