@@ -1,115 +1,4 @@
-def detect(self, image):
-        """Run inference on an image and return detections"""
-        # Preprocess the image
-        input_img = self.preprocess(image)
-        
-        # Copy input data to input buffer
-        np.copyto(self.inputs[0]['host'], input_img.ravel())
-        
-        # Transfer data from host to device (GPU)
-        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
-        
-        # Run inference
-        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
-        
-        # Transfer predictions from device to host
-        for out in self.outputs:
-            cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
-        
-        # Synchronize the stream to wait for all operations to finish
-        self.stream.synchronize()
-        
-        # Process detections based on detected output format
-        detections = []
-        output = self.outputs[0]['host']
-        output_shape = self.outputs[0]['shape']
-        
-        # Process based on pre-determined format for better performance
-        if self.output_format == "nms_boxes":
-            # Format: [num_detections, 7] with [batch_id, x1, y1, x2, y2, confidence, class_id]
-            num_outputs = output_shape[0]
-            reshaped_output = output.reshape(num_outputs, 7)
-            
-            for i in range(num_outputs):
-                confidence = reshaped_output[i][5]
-                
-                # Skip rows with zero confidence or batch_id != 0
-                if confidence <= self.conf_threshold or reshaped_output[i][0] != 0:
-                    continue
-                
-                # Get coordinates
-                x1, y1, x2, y2 = reshaped_output[i][1:5]
-                
-                # Check if coordinates are normalized (0-1) or absolute
-                if max(x1, x2, y1, y2) > 1.0:
-                    # If coordinates are in pixels, convert to normalized
-                    img_height, img_width = image.shape[:2]
-                    x1, x2 = x1/img_width, x2/img_width
-                    y1, y2 = y1/img_height, y2/img_height
-                
-                class_id = int(reshaped_output[i][6])
-                
-                # Add valid detections
-                if x1 < x2 and y1 < y2 and 0 <= class_id < len(classNames):
-                    detections.append({
-                        'box': [x1, y1, x2, y2],
-                        'confidence': float(confidence),
-                        'class_id': int(class_id)
-                    })
-                
-        elif self.output_format == "raw_output":
-            # Format: [batch, num_anchors, num_classes+5]
-            batch_size = output_shape[0]
-            num_anchors = output_shape[1]
-            num_values = output_shape[2]
-            
-            reshaped_output = output.reshape(batch_size, num_anchors, num_values)
-            
-            # Process only first batch for simplicity
-            for i in range(num_anchors):
-                # Get box confidence
-                confidence = reshaped_output[0, i, 4]
-                
-                if confidence > self.conf_threshold:
-                    # Get class scores
-                    class_scores = reshaped_output[0, i, 5:]
-                    class_id = np.argmax(class_scores)
-                    
-                    # YOLOv8 outputs center_x, center_y, width, height
-                    x, y, w, h = reshaped_output[0, i, 0:4]
-                    
-                    # Convert to corner coordinates
-                    x1 = max(0, x - w/2)
-                    y1 = max(0, y - h/2)
-                    x2 = min(1, x + w/2)
-                    y2 = min(1, y + h/2)
-                    
-                    if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 and class_id < len(classNames):
-                        detections.append({
-                            'box': [x1, y1, x2, y2],
-                            'confidence': float(confidence),
-                            'class_id': int(class_id)
-                        })
-                    
-        elif self.output_format == "yolo_flat":
-            # Format: Flat array that can be reshaped to [num_anchors, 84]
-            num_anchors = len(output) // 84
-            reshaped_output = output.reshape(num_anchors, 84)
-            
-            for i in range(num_anchors):
-                confidence = reshaped_output[i, 4]
-                if confidence > self.conf_threshold:
-                    class_scores = reshaped_output[i, 5:84]
-                    class_id = np.argmax(class_scores)
-                    
-                    # Convert from center format to corner format
-                    x, y, w, h = reshaped_output[i, 0:4]
-                    x1 = max(0, x - w/2)
-                    y1 = max(0, y - h/2)
-                    x2 = min(1, x + w/2)
-                    y2 = min(1, y + h/2)
-                    
-                    if 0 <= x1import cv2
+import cv2
 import time
 import numpy as np
 import tensorrt as trt
@@ -179,11 +68,13 @@ class TensorRTDetector:
         self.context = self.engine.create_execution_context()
         
         # Get input and output shapes
-        self.input_binding_idx = 0  # Assume first binding is input
-        for i in range(self.engine.num_bindings):
-            if self.engine.binding_is_input(i):
-                self.input_binding_idx = i
-                break
+        self.input_binding_idx = self.engine.get_binding_index('images')  # Default YOLOv8 input name
+        if self.input_binding_idx == -1:
+            # Try alternative input name if 'images' isn't found
+            for i in range(self.engine.num_bindings):
+                if self.engine.binding_is_input(i):
+                    self.input_binding_idx = i
+                    break
         
         # Get the shape of the input binding
         self.input_shape = self.engine.get_binding_shape(self.input_binding_idx)
@@ -225,37 +116,27 @@ class TensorRTDetector:
                 self.outputs.append({'host': host_mem, 'device': device_mem, 'shape': binding_shape})
         
         print(f"Detector initialized with input shape: {self.input_shape}")
-        
-        # Determine output format once at initialization
-        self.output_format = "unknown"
-        output_shape = self.outputs[0]['shape']
-        if len(output_shape) == 2 and output_shape[1] == 7:
-            self.output_format = "nms_boxes"
-        elif len(output_shape) == 3 and output_shape[2] > 5:
-            self.output_format = "raw_output"
-        elif len(output_shape) == 1:
-            if len(self.outputs[0]['host']) % 84 == 0:
-                self.output_format = "yolo_flat"
-        print(f"Using output format: {self.output_format}")
     
     def preprocess(self, image):
-        """Preprocess image for inference"""
-        # Resize
-        input_img = cv2.resize(image, (self.width, self.height))
+        """Preprocess image for inference - optimized for speed"""
+        # Resize - use INTER_NEAREST for speed
+        input_img = cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
         
-        # Convert to RGB (YOLOv8 expects RGB)
-        input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+        # Preallocate arrays to avoid repeated memory allocations
+        if not hasattr(self, 'input_buffer'):
+            # Initialize preprocessing buffers
+            self.input_buffer = np.zeros((self.batch_size, self.channels, self.height, self.width), dtype=np.float32)
         
-        # Normalize to [0,1]
-        input_img = input_img.astype(np.float32) / 255.0
+        # Convert to RGB and normalize using vectorized operations
+        # Avoid creating intermediate arrays
+        input_img = input_img[:, :, ::-1]  # BGR to RGB (faster than cvtColor)
+        np.divide(input_img, 255.0, out=input_img, dtype=np.float32)
         
-        # HWC to CHW format (convert to channels first)
-        input_img = input_img.transpose((2, 0, 1))
+        # Transpose directly into preallocated buffer (CHW format)
+        for c in range(3):
+            self.input_buffer[0, c] = input_img[:, :, c]
         
-        # Add batch dimension
-        input_img = np.expand_dims(input_img, axis=0)
-        
-        return input_img
+        return self.input_buffer
     
     def detect(self, image):
         """Run inference on an image and return detections"""
@@ -285,115 +166,169 @@ class TensorRTDetector:
         output = self.outputs[0]['host']
         output_shape = self.outputs[0]['shape']
         
-        # Handle based on previously identified format (reduce debugging overhead)
-        try:
+        # Use cached format detection after first frame
+        if hasattr(self, 'detected_format'):
+            format_type = self.detected_format
+        else:
+            # Detect format only on first run
+            format_type = None
             # Format 1: Direct boxes - for engines exported with end2end NMS
-            # Shape: [num_detections, 7] where each row is [batch_id, x1, y1, x2, y2, confidence, class_id]
             if len(output_shape) == 2 and output_shape[1] == 7:
-                num_outputs = output_shape[0]
-                reshaped_output = output.reshape(num_outputs, 7)
+                format_type = "nms"
+            # Format 2: Raw output without NMS
+            elif len(output_shape) == 3 and output_shape[2] > 5:
+                format_type = "raw"
+            # Format 3: Single linear array
+            elif len(output_shape) == 1:
+                # Try YOLOv8's format (common for 640x640 models)
+                if len(output) % 84 == 0:
+                    format_type = "linear84"
+                elif len(output) % 85 == 0:
+                    format_type = "linear85"
+                else:
+                    format_type = "unknown"
+            
+            # Cache the detected format
+            self.detected_format = format_type
+            print(f"Detected format: {format_type}, Output shape: {output_shape}")
+        
+        # Process based on detected format
+        if format_type == "nms":
+            # Format: [num_detections, 7] with NMS
+            num_outputs = output_shape[0]
+            reshaped_output = output.reshape(num_outputs, 7)
+            
+            # Process only the first few rows (many will be zero-padded)
+            for i in range(min(100, num_outputs)):
+                confidence = reshaped_output[i][5]
+                if confidence <= self.conf_threshold:
+                    continue
                 
-                for i in range(num_outputs):
-                    confidence = reshaped_output[i][5]
+                # Get coordinates and class
+                x1, y1, x2, y2 = reshaped_output[i][1:5]
+                class_id = int(reshaped_output[i][6])
+                
+                # Normalize coordinates if needed
+                if x1 > 1 or y1 > 1 or x2 > 1 or y2 > 1:
+                    img_height, img_width = image.shape[:2]
+                    x1, x2 = x1/img_width, x2/img_width
+                    y1, y2 = y1/img_height, y2/img_height
+                
+                # Only add valid detections
+                if x1 < x2 and y1 < y2 and 0 <= class_id < len(classNames):
+                    detections.append({
+                        'box': [x1, y1, x2, y2],
+                        'confidence': float(confidence),
+                        'class_id': class_id
+                    })
+            
+        elif format_type == "raw":
+            # Format: [batch, num_anchors, num_classes+5]
+            batch_size = output_shape[0]
+            num_anchors = output_shape[1]
+            num_values = output_shape[2]
+            
+            # Process only first batch, limit anchors for speed
+            max_anchors = min(1000, num_anchors)  # Limit processing
+            
+            # Vectorized approach for faster processing
+            reshaped = output.reshape(batch_size, num_anchors, num_values)
+            confidences = reshaped[0, :max_anchors, 4]
+            
+            # Filter by confidence
+            confident_idx = np.where(confidences > self.conf_threshold)[0]
+            
+            for idx in confident_idx:
+                class_scores = reshaped[0, idx, 5:]
+                class_id = np.argmax(class_scores)
+                
+                if class_id < len(classNames):
+                    x, y, w, h = reshaped[0, idx, 0:4]
                     
-                    # Skip rows with zero confidence or batch_id != 0
-                    if confidence <= self.conf_threshold or reshaped_output[i][0] != 0:
-                        continue
+                    # Convert to corner format
+                    x1 = max(0, x - w/2)
+                    y1 = max(0, y - h/2)
+                    x2 = min(1, x + w/2)
+                    y2 = min(1, y + h/2)
                     
-                    # Get coordinates (these are often already in pixel coordinates for some engines)
-                    x1, y1, x2, y2 = reshaped_output[i][1:5]
-                    
-                    # Check if coordinates are normalized (0-1) or absolute
-                    if max(x1, x2, y1, y2) > 1.0:
-                        # If coordinates are in pixels, convert to normalized
-                        img_height, img_width = image.shape[:2]
-                        x1, x2 = x1/img_width, x2/img_width
-                        y1, y2 = y1/img_height, y2/img_height
-                    
-                    class_id = int(reshaped_output[i][6])
-                    
-                    # Add only valid detections
-                    if x1 < x2 and y1 < y2 and 0 <= class_id < len(classNames):
+                    if x1 < x2 and y1 < y2:
                         detections.append({
-                            'box': [x1, y1, x2, y2],  # Normalized coordinates
-                            'confidence': float(confidence),
+                            'box': [x1, y1, x2, y2],
+                            'confidence': float(confidences[idx]),
                             'class_id': int(class_id)
                         })
+        
+        elif format_type == "linear84" or format_type == "linear85":
+            # Format: linear array that can be reshaped
+            cols = 84 if format_type == "linear84" else 85
+            num_anchors = len(output) // cols
             
-            # Format 2: Raw output without NMS
-            # Shape: [batch, num_anchors, num_classes+5]
-            elif len(output_shape) == 3 and output_shape[2] > 5:
-                batch_size = output_shape[0]
-                num_anchors = output_shape[1]
-                num_values = output_shape[2]
-                num_classes = num_values - 5
+            # Reshape and get only first 1000 for speed
+            max_anchors = min(1000, num_anchors)
+            reshaped = output.reshape(num_anchors, cols)[:max_anchors]
+            
+            # Vectorized confidence filtering
+            confidences = reshaped[:, 4]
+            mask = confidences > self.conf_threshold
+            filtered = reshaped[mask]
+            
+            for i in range(len(filtered)):
+                # Get class with highest score
+                class_scores = filtered[i, 5:min(cols, 85)]
+                class_id = np.argmax(class_scores)
                 
-                reshaped_output = output.reshape(batch_size, num_anchors, num_values)
-                
-                # Process only first batch for simplicity
-                for i in range(num_anchors):
-                    # Get box confidence
-                    confidence = reshaped_output[0, i, 4]
+                if class_id < len(classNames):
+                    # Get coordinates
+                    x, y, w, h = filtered[i, 0:4]
                     
-                    if confidence > self.conf_threshold:
-                        # Get class scores
-                        class_scores = reshaped_output[0, i, 5:]
-                        class_id = np.argmax(class_scores)
-                        class_confidence = class_scores[class_id]
+                    # Convert to corner format
+                    x1 = max(0, x - w/2)
+                    y1 = max(0, y - h/2)
+                    x2 = min(1, x + w/2)
+                    y2 = min(1, y + h/2)
+                    
+                    if x1 < x2 and y1 < y2:
+                        detections.append({
+                            'box': [x1, y1, x2, y2],
+                            'confidence': float(filtered[i, 4]),
+                            'class_id': int(class_id)
+                        })
+        
+        else:
+            # Fallback for unknown formats - simplified to reduce overhead
+            max_check = min(1000, len(output)//6*6)
+            for i in range(0, max_check, 6):
+                try:
+                    if output[i+4] > self.conf_threshold:
+                        x, y, w, h = output[i:i+4]
+                        confidence = output[i+4]
+                        class_id = int(output[i+5])
                         
-                        if class_confidence > 0.1:  # Lower threshold for class confidence
-                            # YOLOv8 outputs center_x, center_y, width, height in normalized coordinates
-                            x, y, w, h = reshaped_output[0, i, 0:4]
-                            
-                            # Convert to corner coordinates (still normalized)
+                        if 0 <= class_id < len(classNames):
                             x1 = max(0, x - w/2)
                             y1 = max(0, y - h/2)
                             x2 = min(1, x + w/2)
                             y2 = min(1, y + h/2)
                             
-                            # Check reasonable values to filter out bad detections
-                            if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 and class_id < len(classNames):
+                            if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1:
                                 detections.append({
                                     'box': [x1, y1, x2, y2],
-                                    'confidence': float(confidence * class_confidence),
-                                    'class_id': int(class_id)
+                                    'confidence': float(confidence),
+                                    'class_id': class_id
                                 })
-            
-            # Format 3: Single linear array - needs special handling
-            elif len(output_shape) == 1:
-                # Check if output is multiple of 84 (4 coords + 1 obj + 79 classes)
-                if len(output) % 84 == 0:
-                    num_anchors = len(output) // 84
-                    reshaped_output = output.reshape(num_anchors, 84)
-                    
-                    for i in range(num_anchors):
-                        confidence = reshaped_output[i, 4]
-                        if confidence > self.conf_threshold:
-                            class_scores = reshaped_output[i, 5:84]
-                            class_id = np.argmax(class_scores)
-                            class_confidence = class_scores[class_id]
-                            
-                            if class_confidence > 0.1:
-                                # Convert from center format to corner format
-                                x, y, w, h = reshaped_output[i, 0:4]
-                                x1 = max(0, x - w/2)
-                                y1 = max(0, y - h/2)
-                                x2 = min(1, x + w/2)
-                                y2 = min(1, y + h/2)
-                                
-                                if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 and class_id < len(classNames):
-                                    detections.append({
-                                        'box': [x1, y1, x2, y2],
-                                        'confidence': float(confidence * class_confidence),
-                                        'class_id': int(class_id)
-                                    })
-        except Exception as e:
-            print(f"Error processing detections: {e}")
+                except:
+                    continue
         
-        # Apply simple NMS if we have many detections
-        if len(detections) > 20:  # Only do NMS if we have many detections
-            # Simple approach: keep only top 10 detections sorted by confidence
-            detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:10]
+        # Fast NMS - only if we have more than 10 detections
+        if len(detections) > 10:
+            # Convert to format needed for NMS
+            boxes = np.array([d['box'] for d in detections])
+            scores = np.array([d['confidence'] for d in detections])
+            
+            # Simple filtering approach - faster than full NMS
+            # Keep only top detections by confidence
+            indices = np.argsort(scores)[::-1][:20]  # Keep top 20
+            detections = [detections[i] for i in indices]
         
         return detections
     
@@ -539,15 +474,15 @@ def main():
     model = TensorRTDetector("yolov8n.engine", conf_threshold=0.25)  # Lower confidence threshold for testing
     print("Model loaded successfully!")
     
-    # Camera settings
-    capture_width = 1280
-    capture_height = 720
+    # Camera settings - reduce resolution for speed
+    capture_width = 640  # Reduced from 1280
+    capture_height = 480  # Reduced from 720
     display_width = 640
-    display_height = 640
+    display_height = 480
     framerate = 30
     flip_method = 0
     
-    # Create pipeline
+    # Create pipeline with lower resolution
     pipeline = gstreamer_pipeline(
         sensor_id=0,
         capture_width=capture_width,
@@ -572,47 +507,9 @@ def main():
     frame_count = 0
     fps = 0
     fps_start_time = time.time()
+    processing_times = []
     
-    # Detection loop
-    try:
-        while True:
-            # Read frame
-            ret, frame = cap.read()
-            if not ret:
-                print("Failed to get frame")
-                break
-                
-            # Update FPS calculation
-            frame_count += 1
-            elapsed_time = time.time() - fps_start_time
-            if elapsed_time >= 1.0:
-                fps = frame_count / elapsed_time
-                frame_count = 0
-                fps_start_time = time.time()
-            
-            # Run inference
-            try:
-                # Detect objects
-                detections = model.detect(frame)
-                
-                # Draw detections on the frame
-                display_frame = frame.copy()
-                model.draw_detections(display_frame, detections)
-                
-            except Exception as infer_error:
-                print(f"Inference error: {infer_error}")
-                display_frame = frame.copy()
-            
-            # Display FPS
-            cv2.putText(
-                display_frame,
-                f"FPS: {fps:.1f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2
-            )
+    # Skip frames variable for speed
             
             # Display the frame
             cv2.imshow(window_name, display_frame)
