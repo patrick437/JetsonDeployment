@@ -127,10 +127,9 @@ class TensorRTDetector:
             # Initialize preprocessing buffers
             self.input_buffer = np.zeros((self.batch_size, self.channels, self.height, self.width), dtype=np.float32)
         
-        # Convert to RGB and normalize using vectorized operations
-        # Avoid creating intermediate arrays
-        input_img = input_img[:, :, ::-1]  # BGR to RGB (faster than cvtColor)
-        np.divide(input_img, 255.0, out=input_img, dtype=np.float32)
+        # Convert to RGB and normalize - use float32 explicitly
+        input_img = input_img[:, :, ::-1].astype(np.float32)  # BGR to RGB, convert to float32
+        input_img /= 255.0  # Normalize
         
         # Transpose directly into preallocated buffer (CHW format)
         for c in range(3):
