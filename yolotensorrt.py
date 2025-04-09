@@ -118,24 +118,23 @@ class TensorRTDetector:
         print(f"Detector initialized with input shape: {self.input_shape}")
     
     def preprocess(self, image):
-        """Preprocess image for inference - optimized for speed"""
-        # Resize - use INTER_NEAREST for speed
+        """Preprocess image for inference - correctly handling color conversion"""
+        # Resize
         input_img = cv2.resize(image, (self.width, self.height), interpolation=cv2.INTER_NEAREST)
         
-        # Preallocate arrays to avoid repeated memory allocations
-        if not hasattr(self, 'input_buffer'):
-            # Initialize preprocessing buffers
-            self.input_buffer = np.zeros((self.batch_size, self.channels, self.height, self.width), dtype=np.float32)
+        # Convert BGR to RGB (YOLOv8 expects RGB)
+        input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
         
-        # Convert to RGB and normalize - use float32 explicitly
-        input_img = input_img[:, :, ::-1].astype(np.float32)  # BGR to RGB, convert to float32
-        input_img /= 255.0  # Normalize
+        # Convert to float32 and normalize
+        input_img = input_img.astype(np.float32) / 255.0
         
-        # Transpose directly into preallocated buffer (CHW format)
-        for c in range(3):
-            self.input_buffer[0, c] = input_img[:, :, c]
+        # Transpose from HWC to CHW format (Height, Width, Channels) -> (Channels, Height, Width)
+        input_img = input_img.transpose(2, 0, 1)
         
-        return self.input_buffer
+        # Add batch dimension
+        input_img = np.expand_dims(input_img, axis=0)
+        
+        return input_img
     
     def detect(self, image):
         """Run inference on an image and return detections"""
