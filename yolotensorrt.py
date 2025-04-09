@@ -546,11 +546,12 @@ def main():
                 # Detect objects
                 detections = model.detect(frame)
                 
-                # Draw detections on the frame (reuse frame instead of copying)
+                # Draw detections directly on the frame
                 model.draw_detections(frame, detections)
                 
             except Exception as infer_error:
                 print(f"Inference error: {infer_error}")
+                # No need to create a copy, just continue with the original frame
             
             # Track processing time
             process_time = time.time() - start_time
