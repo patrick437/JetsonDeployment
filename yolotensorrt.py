@@ -4,6 +4,10 @@ import numpy as np
 import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
+import warnings
+
+# Suppress numpy deprecated warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 def gstreamer_pipeline(
     sensor_id=0,
@@ -156,65 +160,195 @@ class TensorRTDetector:
         # Process detections based on YOLOv8 output format
         detections = []
         
-        # For YOLOv8 detection models, the output format is typically:
-        # [batch_size, num_detections, 85] where 85 = 4 (box) + 1 (confidence) + 80 (class scores)
+        # Get output data
         output = self.outputs[0]['host']
-        
-        # Get output shape from model - YOLOv8 output formats can vary
         output_shape = self.outputs[0]['shape']
         
-        # Try to determine format based on shape
-        if len(output_shape) == 3 and output_shape[2] > 4 + 1:  # [batch, num_dets, num_classes+5]
-            # Shaped for direct detection output
-            num_dets = output_shape[1]
-            num_classes = output_shape[2] - 5
+        # Print debugging info
+        print(f"Output shape: {output_shape}")
+        
+        # Try to determine the format of the output
+        try:
+            # Debug: Look at a sample of the output
+            output_sample = output[:20]
+            print(f"Output sample first 20 elements: {output_sample}")
             
-            # Reshape output to match the detection format
-            output = output.reshape((num_dets, num_classes + 5))
+            # Common YOLOv8 TensorRT output formats:
             
-            # Filter detections by confidence threshold
-            for i in range(num_dets):
-                confidence = output[i][4]  # Box confidence score
+            # Format 1: Direct boxes - for engines exported with end2end NMS
+            # Shape: [num_detections, 7] where each row is [batch_id, x1, y1, x2, y2, confidence, class_id]
+            if len(output_shape) == 2 and output_shape[1] == 7:
+                print("Detected Format: [num_detections, 7] with NMS")
+                num_outputs = output_shape[0]
+                reshaped_output = output.reshape(num_outputs, 7)
                 
-                if confidence > self.conf_threshold:
-                    # Get class scores
-                    class_scores = output[i][5:]
-                    class_id = np.argmax(class_scores)
-                    class_confidence = class_scores[class_id]
+                for i in range(num_outputs):
+                    confidence = reshaped_output[i][5]
                     
-                    if class_confidence > self.conf_threshold:
-                        # YOLOv8 outputs center_x, center_y, width, height in normalized coordinates
-                        x, y, w, h = output[i][0:4]
-                        
-                        # Convert to corner coordinates (still normalized)
-                        x1 = x - w/2
-                        y1 = y - h/2
-                        x2 = x + w/2
-                        y2 = y + h/2
-                        
-                        # Add to detections
+                    # Skip rows with zero confidence or batch_id != 0
+                    if confidence <= self.conf_threshold or reshaped_output[i][0] != 0:
+                        continue
+                    
+                    # Get coordinates (these are often already in pixel coordinates for some engines)
+                    x1, y1, x2, y2 = reshaped_output[i][1:5]
+                    
+                    # Check if coordinates are normalized (0-1) or absolute
+                    if 0 <= x1 <= 1 and 0 <= x2 <= 1 and 0 <= y1 <= 1 and 0 <= y2 <= 1:
+                        is_normalized = True
+                    else:
+                        # If coordinates are in pixels, convert to normalized
+                        is_normalized = False
+                        img_height, img_width = image.shape[:2]
+                        x1, x2 = x1/img_width, x2/img_width
+                        y1, y2 = y1/img_height, y2/img_height
+                    
+                    class_id = int(reshaped_output[i][6])
+                    
+                    # Add only valid detections (some engines pad with zeros)
+                    if x1 < x2 and y1 < y2 and class_id < len(classNames):
                         detections.append({
                             'box': [x1, y1, x2, y2],  # Normalized coordinates
-                            'confidence': float(confidence * class_confidence),
+                            'confidence': float(confidence),
                             'class_id': int(class_id)
                         })
-        elif len(output_shape) == 2:
-            # Alternative format: [num_dets, 7] format with batch_id, x1, y1, x2, y2, confidence, class_id
-            output = output.reshape((-1, 7))
             
-            for detection in output:
-                if detection[5] > self.conf_threshold:
-                    # Extract normalized box coordinates
-                    x1, y1, x2, y2 = detection[1:5]
-                    confidence = detection[5]
-                    class_id = int(detection[6])
+            # Format 2: Raw output without NMS
+            # Shape: [batch, num_anchors, num_classes+5]
+            elif len(output_shape) == 3 and output_shape[2] > 5:
+                print("Detected Format: Raw output without NMS")
+                batch_size = output_shape[0]
+                num_anchors = output_shape[1]
+                num_values = output_shape[2]
+                num_classes = num_values - 5
+                
+                reshaped_output = output.reshape(batch_size, num_anchors, num_values)
+                
+                # Process only first batch for simplicity
+                for i in range(num_anchors):
+                    # Get box confidence
+                    confidence = reshaped_output[0, i, 4]
                     
-                    detections.append({
-                        'box': [x1, y1, x2, y2],  # Normalized coordinates
-                        'confidence': float(confidence),
-                        'class_id': int(class_id)
-                    })
+                    if confidence > self.conf_threshold:
+                        # Get class scores
+                        class_scores = reshaped_output[0, i, 5:]
+                        class_id = np.argmax(class_scores)
+                        class_confidence = class_scores[class_id]
+                        
+                        if class_confidence > 0.1:  # Lower threshold for class confidence
+                            # YOLOv8 outputs center_x, center_y, width, height in normalized coordinates
+                            x, y, w, h = reshaped_output[0, i, 0:4]
+                            
+                            # Convert to corner coordinates (still normalized)
+                            x1 = max(0, x - w/2)
+                            y1 = max(0, y - h/2)
+                            x2 = min(1, x + w/2)
+                            y2 = min(1, y + h/2)
+                            
+                            # Check reasonable values to filter out bad detections
+                            if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 and class_id < len(classNames):
+                                detections.append({
+                                    'box': [x1, y1, x2, y2],
+                                    'confidence': float(confidence * class_confidence),
+                                    'class_id': int(class_id)
+                                })
+            
+            # Format 3: Single linear array - needs special handling
+            elif len(output_shape) == 1:
+                print("Detected Format: Linear array (custom format)")
+                # This format needs special handling based on your specific model
+                # Try a few common patterns
+                
+                # Try YOLOv8's 8400x84 format (common for 640x640 models)
+                try:
+                    # Check if output is multiple of 84 (4 coords + 1 obj + 79 classes)
+                    if len(output) % 84 == 0:
+                        num_anchors = len(output) // 84
+                        reshaped_output = output.reshape(num_anchors, 84)
+                        
+                        for i in range(num_anchors):
+                            confidence = reshaped_output[i, 4]
+                            if confidence > self.conf_threshold:
+                                class_scores = reshaped_output[i, 5:84]
+                                class_id = np.argmax(class_scores)
+                                class_confidence = class_scores[class_id]
+                                
+                                if class_confidence > 0.1:
+                                    # Convert from center format to corner format
+                                    x, y, w, h = reshaped_output[i, 0:4]
+                                    x1 = max(0, x - w/2)
+                                    y1 = max(0, y - h/2)
+                                    x2 = min(1, x + w/2)
+                                    y2 = min(1, y + h/2)
+                                    
+                                    if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1 and class_id < len(classNames):
+                                        detections.append({
+                                            'box': [x1, y1, x2, y2],
+                                            'confidence': float(confidence * class_confidence),
+                                            'class_id': int(class_id)
+                                        })
+                except Exception as e:
+                    print(f"Error trying to interpret as 84-col format: {e}")
+                
+                # Try alternate formats if needed
+                # Add more format handlers here if the above doesn't work
+            
+            # If we have no valid detections after all format attempts, try a last resort approach
+            if not detections and len(output) > 0:
+                print("Using fallback detection method")
+                # Try to extract any valid boxes from the raw output
+                # This is a last resort for unknown formats
+                max_val = np.max(output)
+                if max_val > 0:
+                    # Normalize the output if values are very large
+                    if max_val > 100:
+                        output = output / max_val
+                    
+                    # Try to find patterns that could represent boxes
+                    for i in range(0, len(output)-6, 6):  # Step by 6 (x,y,w,h,conf,class)
+                        try:
+                            x, y, w, h = output[i:i+4]
+                            confidence = output[i+4]
+                            class_id = int(output[i+5])
+                            
+                            # Only accept reasonable values
+                            if (0 <= x <= 1 and 0 <= y <= 1 and 
+                                0 < w < 1 and 0 < h < 1 and 
+                                confidence > self.conf_threshold and
+                                0 <= class_id < len(classNames)):
+                                
+                                x1 = max(0, x - w/2)
+                                y1 = max(0, y - h/2)
+                                x2 = min(1, x + w/2)
+                                y2 = min(1, y + h/2)
+                                
+                                detections.append({
+                                    'box': [x1, y1, x2, y2],
+                                    'confidence': float(confidence),
+                                    'class_id': int(class_id)
+                                })
+                        except:
+                            continue
+        except Exception as e:
+            print(f"Error processing detections: {e}")
         
+        # Apply NMS if we have many detections
+        if len(detections) > 30:
+            # Convert to format needed for NMS
+            boxes = np.array([d['box'] for d in detections])
+            scores = np.array([d['confidence'] for d in detections])
+            class_ids = np.array([d['class_id'] for d in detections])
+            
+            # Perform NMS
+            try:
+                from nms import non_max_suppression_fast
+                indices = non_max_suppression_fast(boxes, scores, 0.4)
+                detections = [detections[i] for i in indices]
+            except ImportError:
+                # If NMS module not available, use a simple filtering approach
+                # Keep only top 20 detections sorted by confidence
+                detections = sorted(detections, key=lambda x: x['confidence'], reverse=True)[:20]
+        
+        print(f"Found {len(detections)} valid detections")
         return detections
     
     def draw_detections(self, image, detections):
@@ -231,19 +365,36 @@ class TensorRTDetector:
                 int(box[3] * img_height)
             ]
             
+            # Filter out invalid boxes (too small or too large)
+            box_width = x2 - x1
+            box_height = y2 - y1
+            
+            # Skip tiny boxes or boxes covering most of the image
+            if box_width < 5 or box_height < 5:
+                continue
+                
+            # Skip boxes that are too large (more than 90% of image)
+            if box_width > img_width * 0.9 and box_height > img_height * 0.9:
+                continue
+            
             # Ensure coordinates are within image boundaries
             x1 = max(0, min(x1, img_width - 1))
             y1 = max(0, min(y1, img_height - 1))
             x2 = max(0, min(x2, img_width - 1))
             y2 = max(0, min(y2, img_height - 1))
             
-            # Draw bounding box
-            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Get class information
+            # Get class information and validate
             class_id = det['class_id']
             confidence = det['confidence']
-            class_name = classNames[class_id] if class_id < len(classNames) else f"Class {class_id}"
+            
+            # Skip invalid class IDs
+            if class_id < 0 or class_id >= len(classNames):
+                continue
+                
+            class_name = classNames[class_id]
+            
+            # Draw bounding box
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
             # Create label with class name and confidence
             label = f"{class_name} {confidence:.2f}"
@@ -271,6 +422,66 @@ class TensorRTDetector:
         
         return image
 
+# Define a simple NMS implementation since the import might not be available
+def non_max_suppression_fast(boxes, scores, overlap_thresh):
+    """
+    Non-maximum suppression implementation for overlapping bounding boxes
+    Args:
+        boxes: array of [x1, y1, x2, y2] (normalized coordinates)
+        scores: array of confidence scores
+        overlap_thresh: overlap threshold for suppression
+    Returns:
+        indices of boxes to keep
+    """
+    # If no boxes, return empty list
+    if len(boxes) == 0:
+        return []
+    
+    # Convert boxes to numpy array if not already
+    if not isinstance(boxes, np.ndarray):
+        boxes = np.array(boxes)
+    
+    # Initialize the list of picked indexes
+    pick = []
+    
+    # Grab the coordinates of the boxes
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+    
+    # Compute the area of the boxes
+    area = (x2 - x1) * (y2 - y1)
+    
+    # Sort the scores from high to low
+    idxs = np.argsort(scores)[::-1]
+    
+    # Keep looping while some indexes still remain in the idxs list
+    while len(idxs) > 0:
+        # Grab the last index in the idxs list and add to the list of picked indexes
+        last = len(idxs) - 1
+        i = idxs[0]
+        pick.append(i)
+        
+        # Find the largest coordinates for the start of the boxes and
+        # the smallest coordinates for the end of the boxes
+        xx1 = np.maximum(x1[i], x1[idxs[1:]])
+        yy1 = np.maximum(y1[i], y1[idxs[1:]])
+        xx2 = np.minimum(x2[i], x2[idxs[1:]])
+        yy2 = np.minimum(y2[i], y2[idxs[1:]])
+        
+        # Compute the width and height of the overlapping area
+        w = np.maximum(0, xx2 - xx1)
+        h = np.maximum(0, yy2 - yy1)
+        
+        # Compute the ratio of overlap
+        overlap = (w * h) / area[idxs[1:]]
+        
+        # Delete all indexes from the idxs list that have overlap greater than threshold
+        idxs = np.delete(idxs, np.concatenate(([0], np.where(overlap > overlap_thresh)[0] + 1)))
+    
+    return pick
+
 # Main function
 def main():
     # Create window
@@ -279,7 +490,7 @@ def main():
     
     # Load TensorRT engine
     print("Loading YOLOv8 TensorRT engine...")
-    model = TensorRTDetector("yolov8n.engine", conf_threshold=0.5)
+    model = TensorRTDetector("yolov8n.engine", conf_threshold=0.25)  # Lower confidence threshold for testing
     print("Model loaded successfully!")
     
     # Camera settings
