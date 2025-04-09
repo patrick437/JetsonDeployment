@@ -510,6 +510,73 @@ def main():
     processing_times = []
     
     # Skip frames variable for speed
+    frame_skip_counter = 0
+    frame_skip_rate = 1  # Process every Nth frame (adjust based on performance)
+    
+    # Detection loop
+    try:
+        while True:
+            # Read frame
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to get frame")
+                break
+                
+            # Skip frames for better performance
+            frame_skip_counter += 1
+            if frame_skip_counter % frame_skip_rate != 0:
+                # Still display the frame, just don't run inference
+                cv2.imshow(window_name, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:  # ESC key
+                    break
+                continue
+            
+            # Update FPS calculation
+            frame_count += 1
+            elapsed_time = time.time() - fps_start_time
+            if elapsed_time >= 1.0:
+                fps = frame_count / elapsed_time
+                frame_count = 0
+                fps_start_time = time.time()
+            
+            # Run inference
+            start_time = time.time()
+            try:
+                # Detect objects
+                detections = model.detect(frame)
+                
+                # Draw detections on the frame (reuse frame instead of copying)
+                model.draw_detections(frame, detections)
+                
+            except Exception as infer_error:
+                print(f"Inference error: {infer_error}")
+            
+            # Track processing time
+            process_time = time.time() - start_time
+            processing_times.append(process_time)
+            if len(processing_times) > 30:
+                processing_times.pop(0)
+            avg_process_time = sum(processing_times) / len(processing_times)
+            
+            # Display FPS and processing time
+            cv2.putText(
+                frame,
+                f"FPS: {fps:.1f} | Inference: {avg_process_time*1000:.1f}ms",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                1
+            )
+            
+            # Display the frame
+            cv2.imshow(window_name, frame)
+            
+            # Check for ESC key to exit
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC key
+                break
             
             # Display the frame
             cv2.imshow(window_name, display_frame)
