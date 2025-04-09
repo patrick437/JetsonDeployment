@@ -158,176 +158,183 @@ class TensorRTDetector:
         # Synchronize the stream to wait for all operations to finish
         self.stream.synchronize()
         
-        # Process detections based on YOLOv8 output format
-        detections = []
-        
         # Get output data
         output = self.outputs[0]['host']
         output_shape = self.outputs[0]['shape']
         
-        # Use cached format detection after first frame
-        if hasattr(self, 'detected_format'):
-            format_type = self.detected_format
-        else:
-            # Detect format only on first run
-            format_type = None
-            # Format 1: Direct boxes - for engines exported with end2end NMS
-            if len(output_shape) == 2 and output_shape[1] == 7:
-                format_type = "nms"
-            # Format 2: Raw output without NMS
-            elif len(output_shape) == 3 and output_shape[2] > 5:
-                format_type = "raw"
-            # Format 3: Single linear array
-            elif len(output_shape) == 1:
-                # Try YOLOv8's format (common for 640x640 models)
-                if len(output) % 84 == 0:
-                    format_type = "linear84"
-                elif len(output) % 85 == 0:
-                    format_type = "linear85"
-                else:
-                    format_type = "unknown"
-            
-            # Cache the detected format
-            self.detected_format = format_type
-            print(f"Detected format: {format_type}, Output shape: {output_shape}")
+        # Debug information - only print this once
+        if not hasattr(self, 'debug_printed'):
+            print(f"Output shape: {output_shape}")
+            print(f"Output sample (first 20 elements): {output[:20]}")
+            self.debug_printed = True
         
-        # Process based on detected format
-        if format_type == "nms":
-            # Format: [num_detections, 7] with NMS
-            num_outputs = output_shape[0]
-            reshaped_output = output.reshape(num_outputs, 7)
-            
-            # Process only the first few rows (many will be zero-padded)
-            for i in range(min(100, num_outputs)):
-                confidence = reshaped_output[i][5]
-                if confidence <= self.conf_threshold:
-                    continue
-                
-                # Get coordinates and class
-                x1, y1, x2, y2 = reshaped_output[i][1:5]
-                class_id = int(reshaped_output[i][6])
-                
-                # Normalize coordinates if needed
-                if x1 > 1 or y1 > 1 or x2 > 1 or y2 > 1:
-                    img_height, img_width = image.shape[:2]
-                    x1, x2 = x1/img_width, x2/img_width
-                    y1, y2 = y1/img_height, y2/img_height
-                
-                # Only add valid detections
-                if x1 < x2 and y1 < y2 and 0 <= class_id < len(classNames):
-                    detections.append({
-                        'box': [x1, y1, x2, y2],
-                        'confidence': float(confidence),
-                        'class_id': class_id
-                    })
-            
-        elif format_type == "raw":
-            # Format: [batch, num_anchors, num_classes+5]
-            batch_size = output_shape[0]
-            num_anchors = output_shape[1]
-            num_values = output_shape[2]
-            
-            # Process only first batch, limit anchors for speed
-            max_anchors = min(1000, num_anchors)  # Limit processing
-            
-            # Vectorized approach for faster processing
-            reshaped = output.reshape(batch_size, num_anchors, num_values)
-            confidences = reshaped[0, :max_anchors, 4]
-            
-            # Filter by confidence
-            confident_idx = np.where(confidences > self.conf_threshold)[0]
-            
-            for idx in confident_idx:
-                class_scores = reshaped[0, idx, 5:]
-                class_id = np.argmax(class_scores)
-                
-                if class_id < len(classNames):
-                    x, y, w, h = reshaped[0, idx, 0:4]
-                    
-                    # Convert to corner format
-                    x1 = max(0, x - w/2)
-                    y1 = max(0, y - h/2)
-                    x2 = min(1, x + w/2)
-                    y2 = min(1, y + h/2)
-                    
-                    if x1 < x2 and y1 < y2:
-                        detections.append({
-                            'box': [x1, y1, x2, y2],
-                            'confidence': float(confidences[idx]),
-                            'class_id': int(class_id)
-                        })
+        # Process detections based on YOLOv8 output format
+        detections = []
         
-        elif format_type == "linear84" or format_type == "linear85":
-            # Format: linear array that can be reshaped
-            cols = 84 if format_type == "linear84" else 85
-            num_anchors = len(output) // cols
-            
-            # Reshape and get only first 1000 for speed
-            max_anchors = min(1000, num_anchors)
-            reshaped = output.reshape(num_anchors, cols)[:max_anchors]
-            
-            # Vectorized confidence filtering
-            confidences = reshaped[:, 4]
-            mask = confidences > self.conf_threshold
-            filtered = reshaped[mask]
-            
-            for i in range(len(filtered)):
-                # Get class with highest score
-                class_scores = filtered[i, 5:min(cols, 85)]
-                class_id = np.argmax(class_scores)
-                
-                if class_id < len(classNames):
-                    # Get coordinates
-                    x, y, w, h = filtered[i, 0:4]
-                    
-                    # Convert to corner format
-                    x1 = max(0, x - w/2)
-                    y1 = max(0, y - h/2)
-                    x2 = min(1, x + w/2)
-                    y2 = min(1, y + h/2)
-                    
-                    if x1 < x2 and y1 < y2:
-                        detections.append({
-                            'box': [x1, y1, x2, y2],
-                            'confidence': float(filtered[i, 4]),
-                            'class_id': int(class_id)
-                        })
+        # Try all possible formats and keep track of which one works
+        formats_to_try = ["nms", "raw", "linear84", "linear85"]
         
-        else:
-            # Fallback for unknown formats - simplified to reduce overhead
-            max_check = min(1000, len(output)//6*6)
-            for i in range(0, max_check, 6):
+        for format_type in formats_to_try:
+            temp_detections = []
+            
+            if format_type == "nms":
+                # Format: [num_detections, 7] with NMS
                 try:
-                    if output[i+4] > self.conf_threshold:
-                        x, y, w, h = output[i:i+4]
-                        confidence = output[i+4]
-                        class_id = int(output[i+5])
+                    # Check if shape is compatible
+                    if len(output_shape) != 2 or output_shape[1] != 7:
+                        continue
+                    
+                    num_outputs = output_shape[0]
+                    reshaped_output = output.reshape(num_outputs, 7)
+                    
+                    # For debugging, print first few rows
+                    if not hasattr(self, 'debug_nms_printed'):
+                        print(f"NMS format first rows: {reshaped_output[:3]}")
+                        self.debug_nms_printed = True
+                    
+                    # Process only the first few rows (many will be zero-padded)
+                    for i in range(min(100, num_outputs)):
+                        confidence = reshaped_output[i][5]
+                        if confidence <= self.conf_threshold:
+                            continue
                         
-                        if 0 <= class_id < len(classNames):
+                        # Get coordinates and class
+                        x1, y1, x2, y2 = reshaped_output[i][1:5]
+                        class_id = int(reshaped_output[i][6])
+                        
+                        # Normalize coordinates if needed
+                        if max(x1, y1, x2, y2) > 1:
+                            img_height, img_width = image.shape[:2]
+                            x1, x2 = x1/img_width, x2/img_width
+                            y1, y2 = y1/img_height, y2/img_height
+                        
+                        # Only add valid detections
+                        if x1 < x2 and y1 < y2 and 0 <= class_id < len(classNames):
+                            temp_detections.append({
+                                'box': [x1, y1, x2, y2],
+                                'confidence': float(confidence),
+                                'class_id': class_id
+                            })
+                except Exception as e:
+                    print(f"Error in NMS format: {e}")
+            
+            elif format_type == "raw":
+                # Format: [batch, num_anchors, num_classes+5]
+                try:
+                    # Check if shape is compatible
+                    if len(output_shape) != 3 or output_shape[2] <= 5:
+                        continue
+                    
+                    batch_size = output_shape[0]
+                    num_anchors = output_shape[1]
+                    num_values = output_shape[2]
+                    
+                    # For debugging, print shape details
+                    if not hasattr(self, 'debug_raw_printed'):
+                        print(f"RAW format shape: {batch_size}x{num_anchors}x{num_values}")
+                        reshaped = output.reshape(batch_size, num_anchors, num_values)
+                        print(f"RAW format first prediction: {reshaped[0, 0, :]}")
+                        self.debug_raw_printed = True
+                    
+                    # Process only first batch, limit anchors for speed
+                    max_anchors = min(1000, num_anchors)
+                    
+                    # Vectorized approach for faster processing
+                    reshaped = output.reshape(batch_size, num_anchors, num_values)
+                    confidences = reshaped[0, :max_anchors, 4]
+                    
+                    # Filter by confidence
+                    confident_idx = np.where(confidences > self.conf_threshold)[0]
+                    
+                    for idx in confident_idx:
+                        class_scores = reshaped[0, idx, 5:]
+                        class_id = np.argmax(class_scores)
+                        
+                        if class_id < len(classNames):
+                            x, y, w, h = reshaped[0, idx, 0:4]
+                            
+                            # Convert to corner format
                             x1 = max(0, x - w/2)
                             y1 = max(0, y - h/2)
                             x2 = min(1, x + w/2)
                             y2 = min(1, y + h/2)
                             
-                            if 0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1:
-                                detections.append({
+                            if x1 < x2 and y1 < y2:
+                                temp_detections.append({
                                     'box': [x1, y1, x2, y2],
-                                    'confidence': float(confidence),
-                                    'class_id': class_id
+                                    'confidence': float(confidences[idx]),
+                                    'class_id': int(class_id)
                                 })
-                except:
-                    continue
-        
-        # Fast NMS - only if we have more than 10 detections
-        if len(detections) > 10:
-            # Convert to format needed for NMS
-            boxes = np.array([d['box'] for d in detections])
-            scores = np.array([d['confidence'] for d in detections])
+                except Exception as e:
+                    print(f"Error in RAW format: {e}")
             
-            # Simple filtering approach - faster than full NMS
-            # Keep only top detections by confidence
-            indices = np.argsort(scores)[::-1][:20]  # Keep top 20
-            detections = [detections[i] for i in indices]
+            elif format_type == "linear84" or format_type == "linear85":
+                # Format: linear array that can be reshaped
+                try:
+                    cols = 84 if format_type == "linear84" else 85
+                    
+                    # Check if shape is compatible
+                    if len(output_shape) != 1 or len(output) % cols != 0:
+                        continue
+                    
+                    num_anchors = len(output) // cols
+                    
+                    # For debugging
+                    if not hasattr(self, f'debug_{format_type}_printed'):
+                        print(f"{format_type} format: {num_anchors}x{cols}")
+                        reshaped = output.reshape(num_anchors, cols)
+                        print(f"{format_type} first row: {reshaped[0, :]}")
+                        setattr(self, f'debug_{format_type}_printed', True)
+                    
+                    # Reshape and get only first 1000 for speed
+                    max_anchors = min(1000, num_anchors)
+                    reshaped = output.reshape(num_anchors, cols)[:max_anchors]
+                    
+                    # Vectorized confidence filtering
+                    confidences = reshaped[:, 4]
+                    mask = confidences > self.conf_threshold
+                    filtered = reshaped[mask]
+                    
+                    for i in range(len(filtered)):
+                        # Get class with highest score
+                        class_scores = filtered[i, 5:min(cols, 85)]
+                        class_id = np.argmax(class_scores)
+                        
+                        if class_id < len(classNames):
+                            # Get coordinates
+                            x, y, w, h = filtered[i, 0:4]
+                            
+                            # Convert to corner format
+                            x1 = max(0, x - w/2)
+                            y1 = max(0, y - h/2)
+                            x2 = min(1, x + w/2)
+                            y2 = min(1, y + h/2)
+                            
+                            if x1 < x2 and y1 < y2:
+                                temp_detections.append({
+                                    'box': [x1, y1, x2, y2],
+                                    'confidence': float(filtered[i, 4]),
+                                    'class_id': int(class_id)
+                                })
+                except Exception as e:
+                    print(f"Error in {format_type} format: {e}")
+            
+            # If we found detections with this format, use them and remember the format
+            if temp_detections:
+                detections = temp_detections
+                # Remember the working format for future frames
+                if not hasattr(self, 'working_format'):
+                    print(f"Working format found: {format_type} - found {len(detections)} detections")
+                    self.working_format = format_type
+                break
+        
+        # If we have a known working format, use only that in the future
+        if hasattr(self, 'working_format') and not detections:
+            print(f"No detections found with known working format {self.working_format}")
+        
+        # Always print some debug info about the detections
+        if len(detections) > 0:
+            print(f"Found {len(detections)} detections: {[det['class_id'] for det in detections[:3]]}...")
         
         return detections
     
