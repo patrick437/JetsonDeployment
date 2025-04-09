@@ -1,6 +1,7 @@
 from ultralytics import YOLO
 import cv2
 import time
+import numpy as np
 
 def gstreamer_pipeline(
     sensor_id=0,
@@ -49,7 +50,7 @@ cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
 # Load the YOLO model
 print("Loading YOLOv8 TensorRT engine...")
-model = YOLO("yolov8n.engine", task="detect")  # Update with your engine path
+model = YOLO("yolov8n.engine", task="detect")
 print("Model loaded successfully!")
 
 # Camera settings
@@ -103,58 +104,154 @@ try:
             frame_count = 0
             fps_start_time = time.time()
         
-        # Run inference
-        results = model(frame, stream=True)
+        # Create a copy of the frame for drawing
+        display_frame = frame.copy()
         
-        # Process detections
-        for r in results:
-            boxes = r.boxes
+        # Run inference
+        try:
+            # Run model and get results - handle different formats
+            results = model(frame)
             
-            for box in boxes:
-                # Bounding box
-                x1, y1, x2, y2 = box.xyxy[0]
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            # Process results - handle both dictionary and object formats
+            if results is not None:
+                # Handle results as list of objects
+                if isinstance(results, list):
+                    for result in results:
+                        if hasattr(result, 'boxes'):
+                            boxes = result.boxes
+                            for box in boxes:
+                                try:
+                                    # Get box coordinates
+                                    if hasattr(box, 'xyxy') and len(box.xyxy) > 0:
+                                        coords = box.xyxy[0].tolist()
+                                        x1, y1, x2, y2 = int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])
+                                        
+                                        # Get confidence and class ID
+                                        conf = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 0.0
+                                        cls_id = int(box.cls[0]) if hasattr(box, 'cls') and len(box.cls) > 0 else 0
+                                        
+                                        # Draw if confidence is high enough
+                                        if conf >= 0.5:
+                                            # Draw bounding box
+                                            cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                            
+                                            # Create label
+                                            class_name = classNames[cls_id] if cls_id < len(classNames) else f"Class {cls_id}"
+                                            label = f"{class_name} {conf:.2f}"
+                                            
+                                            # Draw label background
+                                            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                                            cv2.rectangle(
+                                                display_frame,
+                                                (x1, y1 - text_size[1] - 5),
+                                                (x1 + text_size[0] + 5, y1),
+                                                (0, 255, 0),
+                                                -1
+                                            )
+                                            
+                                            # Draw text
+                                            cv2.putText(
+                                                display_frame,
+                                                label,
+                                                (x1 + 3, y1 - 5),
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                0.5,
+                                                (0, 0, 0),
+                                                2
+                                            )
+                                except Exception as box_error:
+                                    print(f"Box processing error: {box_error}")
                 
-                # Confidence and class
-                conf = float(box.conf[0])
-                cls_id = int(box.cls[0])
+                # Alternative: Handle results as a single object
+                elif hasattr(results, 'boxes'):
+                    boxes = results.boxes
+                    for box in boxes:
+                        try:
+                            # Get box coordinates
+                            if hasattr(box, 'xyxy') and len(box.xyxy) > 0:
+                                coords = box.xyxy[0].tolist()
+                                x1, y1, x2, y2 = int(coords[0]), int(coords[1]), int(coords[2]), int(coords[3])
+                                
+                                # Get confidence and class ID
+                                conf = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 0.0
+                                cls_id = int(box.cls[0]) if hasattr(box, 'cls') and len(box.cls) > 0 else 0
+                                
+                                # Draw if confidence is high enough
+                                if conf >= 0.5:
+                                    # Draw bounding box
+                                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                    
+                                    # Create label
+                                    class_name = classNames[cls_id] if cls_id < len(classNames) else f"Class {cls_id}"
+                                    label = f"{class_name} {conf:.2f}"
+                                    
+                                    # Draw label background
+                                    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                                    cv2.rectangle(
+                                        display_frame,
+                                        (x1, y1 - text_size[1] - 5),
+                                        (x1 + text_size[0] + 5, y1),
+                                        (0, 255, 0),
+                                        -1
+                                    )
+                                    
+                                    # Draw text
+                                    cv2.putText(
+                                        display_frame,
+                                        label,
+                                        (x1 + 3, y1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.5,
+                                        (0, 0, 0),
+                                        2
+                                    )
+                        except Exception as box_error:
+                            print(f"Box processing error: {box_error}")
                 
-                # Filter by confidence
-                if conf >= 0.5:  # Adjust threshold as needed
-                    # Draw bounding box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
-                    # Create label with class name and confidence
-                    label = f"{classNames[cls_id]} {conf:.2f}"
-                    
-                    # Calculate text size for background
-                    (text_width, text_height), _ = cv2.getTextSize(
-                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
-                    )
-                    
-                    # Draw filled rectangle for label background
-                    cv2.rectangle(
-                        frame,
-                        (x1, y1 - text_height - 5),
-                        (x1 + text_width + 5, y1),
-                        (0, 255, 0),
-                        -1
-                    )
-                    
-                    # Put text
-                    cv2.putText(
-                        frame,
-                        label,
-                        (x1 + 3, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 0, 0),
-                        2
-                    )
+                # Handle numpy array-like results (direct tensor output)
+                elif isinstance(results, np.ndarray) or (hasattr(results, '__array__') and callable(results.__array__)):
+                    detections = np.array(results)
+                    if detections.size > 0:
+                        # Assume format [x1, y1, x2, y2, conf, class_id]
+                        for detection in detections:
+                            if len(detection) >= 6:
+                                x1, y1, x2, y2 = int(detection[0]), int(detection[1]), int(detection[2]), int(detection[3])
+                                conf = float(detection[4])
+                                cls_id = int(detection[5])
+                                
+                                if conf >= 0.5:
+                                    # Draw bounding box
+                                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                    
+                                    # Create label
+                                    class_name = classNames[cls_id] if cls_id < len(classNames) else f"Class {cls_id}"
+                                    label = f"{class_name} {conf:.2f}"
+                                    
+                                    # Draw label
+                                    text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                                    cv2.rectangle(
+                                        display_frame,
+                                        (x1, y1 - text_size[1] - 5),
+                                        (x1 + text_size[0] + 5, y1),
+                                        (0, 255, 0),
+                                        -1
+                                    )
+                                    cv2.putText(
+                                        display_frame,
+                                        label,
+                                        (x1 + 3, y1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.5,
+                                        (0, 0, 0),
+                                        2
+                                    )
+                
+        except Exception as infer_error:
+            print(f"Inference error: {infer_error}")
         
         # Display FPS
         cv2.putText(
-            frame,
+            display_frame,
             f"FPS: {fps:.1f}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -164,7 +261,7 @@ try:
         )
         
         # Display the frame
-        cv2.imshow(window_name, frame)
+        cv2.imshow(window_name, display_frame)
         
         # Check for ESC key to exit
         key = cv2.waitKey(1) & 0xFF
