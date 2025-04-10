@@ -139,10 +139,12 @@ class TensorRTDetector:
         input_img = np.ascontiguousarray(input_img)
         return input_img
 
+# --- DETECT METHOD (WITH NMS BYPASSED and RAW SCORE PRINTING) ---
     def detect(self, frame_for_model):
         """
         Run inference on the frame (already resized) and return detections.
-        *** NOTE: THIS VERSION BYPASSES NMS FOR DEBUGGING ***
+        *** NOTE: NMS IS BYPASSED in this version for debugging. ***
+        *** Includes detailed raw score printing for the first frame with detections. ***
         """
         # Preprocess the frame provided (which should already be model input size)
         input_img = self.preprocess(frame_for_model)
@@ -166,8 +168,7 @@ class TensorRTDetector:
 
         if not self.debug_output_printed:
             print(f"Raw Output shape: {output_shape}")
-            # print(f"Raw Output sample (first 20 elements): {output_data[:20]}") # Optional detailed print
-            self.debug_output_printed = True # Print only once
+            self.debug_output_printed = True
 
         num_classes = len(classNames) # Assumes classNames is defined globally or accessible
         num_coords = 4
@@ -199,69 +200,76 @@ class TensorRTDetector:
         # --- Initial Filtering by Confidence ---
         detections_batch = processed_output[0] # Shape: (num_detections, channels)
         boxes_xywh = detections_batch[:, :num_coords] # cx, cy, w, h (normalized)
-        all_scores = detections_batch[:, num_coords:] # class scores
+        all_scores = detections_batch[:, num_coords:] # class scores (num_detections, num_classes)
         class_ids = np.argmax(all_scores, axis=1)
         max_confidences = np.max(all_scores, axis=1)
 
-        keep = max_confidences >= self.conf_threshold
-        if not np.any(keep):
-             # print("No detections passed confidence threshold.") # Optional debug print
-             return [] # Exit early if no boxes pass confidence
+        # Indices of detections passing the confidence threshold *within detections_batch*
+        keep_indices_in_batch = np.where(max_confidences >= self.conf_threshold)[0]
 
-        # Get data for boxes that passed confidence threshold
-        filtered_boxes_xywh = boxes_xywh[keep]
-        filtered_confidences = max_confidences[keep]
-        filtered_class_ids = class_ids[keep]
+        if len(keep_indices_in_batch) == 0:
+             # print("No detections passed confidence threshold.") # Optional debug
+             # Reset flags if no detections found this frame, so next frame prints again if needed
+             self.nms_debug_printed = False
+             self.debug_final_printed = False
+             return [] # Exit early
 
-        # Generate xyxy boxes needed for drawing (and potentially NMS if re-enabled)
+        # Get data ONLY for boxes that passed confidence threshold
+        filtered_boxes_xywh = boxes_xywh[keep_indices_in_batch]
+        filtered_confidences = max_confidences[keep_indices_in_batch]
+        filtered_class_ids = class_ids[keep_indices_in_batch]
+        filtered_raw_scores = all_scores[keep_indices_in_batch] # Get raw scores for filtered boxes
+
+        # Generate xyxy boxes needed for drawing
         x_center, y_center, width, height = filtered_boxes_xywh.T
         x1 = x_center - width / 2; y1 = y_center - height / 2
         x2 = x_center + width / 2; y2 = y_center + height / 2
         filtered_boxes_xyxy = np.stack((x1, y1, x2, y2), axis=1)
 
-        if not self.nms_debug_printed: # Debug: Print count before NMS
-             print(f"DEBUG: Found {len(filtered_boxes_xywh)} detections pre-NMS")
-             self.nms_debug_printed = True # Print only once per run usually
+        if not self.nms_debug_printed: # Debug: Print count pre-NMS once
+             print(f"DEBUG: Found {len(filtered_boxes_xywh)} detections pre-NMS (Conf > {self.conf_threshold:.2f})")
+             self.nms_debug_printed = True
 
         # --- NMS STEP BYPASSED FOR DEBUGGING ---
-        # The following block comments out the call to cv2.dnn.NMSBoxes
-        # and instead uses all boxes that passed the confidence threshold.
-
-        # boxes_for_nms = filtered_boxes_xywh.tolist()
-        # confidences_for_nms = filtered_confidences.tolist()
-        # indices_to_keep_nms = [] # Default to empty
-        # if boxes_for_nms and confidences_for_nms: # Ensure lists aren't empty
-        #     try:
-        #         indices_to_keep_nms = cv2.dnn.NMSBoxes(
-        #             bboxes=boxes_for_nms,          # Must be list of [cx, cy, w, h]
-        #             scores=confidences_for_nms,    # Must be list of floats
-        #             score_threshold=self.conf_threshold, # Filters boxes *again* by score
-        #             nms_threshold=self.nms_threshold     # IoU threshold
-        #         )
-        #         # Handle potential empty output or older OpenCV versions returning tuples
-        #         if isinstance(indices_to_keep_nms, tuple):
-        #             indices_to_keep_nms = indices_to_keep_nms[0]
-        #         # Flatten in case it's returned as a column vector [[0], [1], ...]
-        #         indices_to_keep_nms = indices_to_keep_nms.flatten()
-        #     except Exception as e:
-        #         print(f"Error during cv2.dnn.NMSBoxes (but currently bypassed): {e}")
-        #         # Keep all boxes if NMS errors (when not bypassed)
-        #         indices_to_keep_nms = list(range(len(filtered_boxes_xyxy)))
-
-        # Instead of using NMS results, create indices for ALL boxes that passed confidence
-        indices_to_keep = list(range(len(filtered_boxes_xyxy)))
-        print(f"DEBUG: NMS bypassed. Using all {len(indices_to_keep)} pre-NMS detections for output.")
+        # We will iterate through all indices that passed the confidence filter directly
+        indices_to_use = list(range(len(filtered_boxes_xywh))) # Indices relative to the *filtered* arrays
+        # print(f"DEBUG: NMS bypassed. Using all {len(indices_to_use)} pre-NMS detections for output.") # Optional print
         # --- END OF NMS BYPASS ---
 
 
-        # --- Prepare final detections list (using ALL pre-NMS boxes) ---
+        # --- Prepare final detections list + PRINT RAW SCORES ---
         final_detections = []
-        # This loop now iterates through all indices from 0 to len(filtered_boxes_xyxy)-1
-        for idx in indices_to_keep:
-             # Get data corresponding to the current index from the filtered arrays
+        # Print header only once when detections are found
+        if not self.debug_final_printed and len(indices_to_use) > 0:
+            print(f"\n--- DETAILED SCORES FOR FRAME (Pre-NMS, Conf > {self.conf_threshold:.2f}) ---")
+
+        # Iterate through the indices of the boxes that passed the confidence threshold
+        for i, idx in enumerate(indices_to_use):
+             # Get data for this specific detection using the index 'idx'
+             # which refers to the position within the *filtered* arrays
              box_xyxy = filtered_boxes_xyxy[idx]
-             confidence = filtered_confidences[idx]
-             class_id = filtered_class_ids[idx]
+             confidence = filtered_confidences[idx] # This is max_score
+             class_id = filtered_class_ids[idx]    # This is argmax result
+             raw_scores_for_this_box = filtered_raw_scores[idx] # Raw scores for this box
+
+             # --- Print Raw Score Details (Only for the first frame with detections) ---
+             if not self.debug_final_printed:
+                 print(f" Detection {i}: ArgMax Class={classNames[class_id]}({class_id}), MaxConf={confidence:.3f}")
+                 # Print Top 5 scores
+                 top_n = 5
+                 # Get indices of top N scores from raw_scores_for_this_box
+                 top_indices = np.argsort(raw_scores_for_this_box)[::-1][:top_n]
+                 print(f"   Top {top_n} Raw Scores:")
+                 for score_idx in top_indices:
+                     score_val = raw_scores_for_this_box[score_idx]
+                     # Only print if score is somewhat significant
+                     if score_val > 0.01: # Adjust threshold to control verbosity
+                         if 0 <= score_idx < len(classNames):
+                             print(f"     - {classNames[score_idx]}({score_idx}): {score_val:.4f}")
+                         else: # Should not happen if num_classes is correct
+                              print(f"     - Invalid Class ID {score_idx}: {score_val:.4f}")
+                 print("-" * 10) # Separator
+             # --- End Print Raw Score Details ---
 
              # Clamp normalized coords to [0, 1] and ensure validity (x1<x2, y1<y2)
              box_xyxy[0] = max(0.0, min(1.0, box_xyxy[0])) # x1
@@ -276,9 +284,10 @@ class TensorRTDetector:
                        'class_id': int(class_id)
                   })
 
-        if not self.debug_final_printed: # Print final count once
-            print(f"DEBUG: Returning {len(final_detections)} detections (NMS bypassed).")
-            self.debug_final_printed = True
+        # Set flag after printing scores for the first frame that has detections
+        # This prevents printing scores for every single subsequent frame
+        if len(indices_to_use) > 0:
+             self.debug_final_printed = True
 
         return final_detections
 
