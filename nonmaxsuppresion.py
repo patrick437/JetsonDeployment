@@ -140,32 +140,41 @@ class TensorRTDetector:
         return input_img
 
     def detect(self, frame_for_model):
-        """Run inference on the frame (already resized) and return detections."""
+        """
+        Run inference on the frame (already resized) and return detections.
+        *** NOTE: THIS VERSION BYPASSES NMS FOR DEBUGGING ***
+        """
+        # Preprocess the frame provided (which should already be model input size)
         input_img = self.preprocess(frame_for_model)
 
+        # Verify input shape matches buffer
         if input_img.shape != self.inputs[0]['shape']:
              raise ValueError(f"Mismatched input shape! Expected {self.inputs[0]['shape']} but got {input_img.shape}.")
 
+        # --- Perform Inference ---
         np.copyto(self.inputs[0]['host'], input_img.ravel())
         cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
         self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
         for out in self.outputs:
             cuda.memcpy_dtoh_async(out['host'], out['device'], self.stream)
         self.stream.synchronize()
+        # --- End Inference ---
 
+        # --- Get and Reshape Output ---
         output_data = self.outputs[0]['host']
         output_shape = self.outputs[0]['shape']
 
         if not self.debug_output_printed:
             print(f"Raw Output shape: {output_shape}")
-            self.debug_output_printed = True
+            # print(f"Raw Output sample (first 20 elements): {output_data[:20]}") # Optional detailed print
+            self.debug_output_printed = True # Print only once
 
-        num_classes = len(classNames)
+        num_classes = len(classNames) # Assumes classNames is defined globally or accessible
         num_coords = 4
         expected_channels = num_classes + num_coords
         processed_output = None
 
-        # --- Reshape/Transpose Logic (same as before) ---
+        # Handle different potential output shapes
         # Case 1: [B, C, D] e.g., (1, 84, 8400)
         if len(output_shape) == 3 and output_shape[0] == self.batch_size and output_shape[1] == expected_channels:
              processed_output = output_data.reshape(output_shape).transpose(0, 2, 1) # -> (B, D, C)
@@ -178,94 +187,97 @@ class TensorRTDetector:
              if total_elements % expected_channels == 0:
                   num_detections = total_elements // expected_channels
                   try: processed_output = output_data.reshape((self.batch_size, num_detections, expected_channels))
-                  except ValueError: return []
-             else: return []
+                  except ValueError: return [] # Reshape failed
+             else:
+                print(f"Cannot process flattened output shape {output_shape}, not divisible by expected channels {expected_channels}")
+                return [] # Cannot process
         else:
-             print(f"Error: Unexpected output shape {output_shape}.")
+             print(f"Error: Unexpected output shape {output_shape}. Cannot determine processing format.")
              return []
         # --- End Reshape/Transpose ---
 
+        # --- Initial Filtering by Confidence ---
         detections_batch = processed_output[0] # Shape: (num_detections, channels)
-        boxes_xywh = detections_batch[:, :num_coords] # cx, cy, w, h
+        boxes_xywh = detections_batch[:, :num_coords] # cx, cy, w, h (normalized)
         all_scores = detections_batch[:, num_coords:] # class scores
         class_ids = np.argmax(all_scores, axis=1)
         max_confidences = np.max(all_scores, axis=1)
 
         keep = max_confidences >= self.conf_threshold
-        if not np.any(keep): return [] # Exit early if no boxes pass confidence
+        if not np.any(keep):
+             # print("No detections passed confidence threshold.") # Optional debug print
+             return [] # Exit early if no boxes pass confidence
 
-        # Filter data based on confidence
+        # Get data for boxes that passed confidence threshold
         filtered_boxes_xywh = boxes_xywh[keep]
         filtered_confidences = max_confidences[keep]
         filtered_class_ids = class_ids[keep]
-        # Also generate xyxy boxes needed later for drawing (after NMS)
+
+        # Generate xyxy boxes needed for drawing (and potentially NMS if re-enabled)
         x_center, y_center, width, height = filtered_boxes_xywh.T
-        x1 = x_center - width / 2
-        y1 = y_center - height / 2
-        x2 = x_center + width / 2
-        y2 = y_center + height / 2
+        x1 = x_center - width / 2; y1 = y_center - height / 2
+        x2 = x_center + width / 2; y2 = y_center + height / 2
         filtered_boxes_xyxy = np.stack((x1, y1, x2, y2), axis=1)
 
         if not self.nms_debug_printed: # Debug: Print count before NMS
-             print(f"Found {len(filtered_boxes_xywh)} detections pre-NMS")
-             self.nms_debug_printed = True
+             print(f"DEBUG: Found {len(filtered_boxes_xywh)} detections pre-NMS")
+             self.nms_debug_printed = True # Print only once per run usually
 
-        # --- Perform NMS using cv2.dnn.NMSBoxes ---
-        # Prepare inputs: list of boxes [cx, cy, w, h], list of scores
-        boxes_for_nms = filtered_boxes_xywh.tolist()
-        confidences_for_nms = filtered_confidences.tolist()
-        indices_to_keep = [] # Default to empty
+        # --- NMS STEP BYPASSED FOR DEBUGGING ---
+        # The following block comments out the call to cv2.dnn.NMSBoxes
+        # and instead uses all boxes that passed the confidence threshold.
 
-        if boxes_for_nms and confidences_for_nms: # Ensure lists aren't empty
-            try:
-                indices_to_keep = cv2.dnn.NMSBoxes(
-                    bboxes=boxes_for_nms,          # Must be list of [cx, cy, w, h]
-                    scores=confidences_for_nms,    # Must be list of floats
-                    score_threshold=self.conf_threshold, # Filters boxes *again* by score
-                    nms_threshold=self.nms_threshold     # IoU threshold
-                )
-                # Handle potential empty output or older OpenCV versions returning tuples
-                if isinstance(indices_to_keep, tuple):
-                    indices_to_keep = indices_to_keep[0]
-                # Flatten in case it's returned as a column vector [[0], [1], ...]
-                indices_to_keep = indices_to_keep.flatten()
-            except Exception as e:
-                print(f"Error during cv2.dnn.NMSBoxes: {e}. Falling back to no NMS for this frame.")
-                # Keep all boxes that passed initial confidence (less ideal)
-                indices_to_keep = list(range(len(filtered_boxes_xyxy)))
-        # --- End NMS ---
+        # boxes_for_nms = filtered_boxes_xywh.tolist()
+        # confidences_for_nms = filtered_confidences.tolist()
+        # indices_to_keep_nms = [] # Default to empty
+        # if boxes_for_nms and confidences_for_nms: # Ensure lists aren't empty
+        #     try:
+        #         indices_to_keep_nms = cv2.dnn.NMSBoxes(
+        #             bboxes=boxes_for_nms,          # Must be list of [cx, cy, w, h]
+        #             scores=confidences_for_nms,    # Must be list of floats
+        #             score_threshold=self.conf_threshold, # Filters boxes *again* by score
+        #             nms_threshold=self.nms_threshold     # IoU threshold
+        #         )
+        #         # Handle potential empty output or older OpenCV versions returning tuples
+        #         if isinstance(indices_to_keep_nms, tuple):
+        #             indices_to_keep_nms = indices_to_keep_nms[0]
+        #         # Flatten in case it's returned as a column vector [[0], [1], ...]
+        #         indices_to_keep_nms = indices_to_keep_nms.flatten()
+        #     except Exception as e:
+        #         print(f"Error during cv2.dnn.NMSBoxes (but currently bypassed): {e}")
+        #         # Keep all boxes if NMS errors (when not bypassed)
+        #         indices_to_keep_nms = list(range(len(filtered_boxes_xyxy)))
 
-        # --- Prepare final detections list ---
+        # Instead of using NMS results, create indices for ALL boxes that passed confidence
+        indices_to_keep = list(range(len(filtered_boxes_xyxy)))
+        print(f"DEBUG: NMS bypassed. Using all {len(indices_to_keep)} pre-NMS detections for output.")
+        # --- END OF NMS BYPASS ---
+
+
+        # --- Prepare final detections list (using ALL pre-NMS boxes) ---
         final_detections = []
+        # This loop now iterates through all indices from 0 to len(filtered_boxes_xyxy)-1
         for idx in indices_to_keep:
-             # Use index 'idx' to get data from the *original filtered* arrays
+             # Get data corresponding to the current index from the filtered arrays
              box_xyxy = filtered_boxes_xyxy[idx]
              confidence = filtered_confidences[idx]
              class_id = filtered_class_ids[idx]
 
-             # Clamp normalized coords to [0, 1] and ensure validity
+             # Clamp normalized coords to [0, 1] and ensure validity (x1<x2, y1<y2)
              box_xyxy[0] = max(0.0, min(1.0, box_xyxy[0])) # x1
              box_xyxy[1] = max(0.0, min(1.0, box_xyxy[1])) # y1
              box_xyxy[2] = max(0.0, min(1.0, box_xyxy[2])) # x2
              box_xyxy[3] = max(0.0, min(1.0, box_xyxy[3])) # y2
 
-             if box_xyxy[0] < box_xyxy[2] and box_xyxy[1] < box_xyxy[3]:
+             if box_xyxy[0] < box_xyxy[2] and box_xyxy[1] < box_xyxy[3]: # Check validity after clamping
                   final_detections.append({
                        'box': box_xyxy.tolist(), # Store normalized [x1, y1, x2, y2]
                        'confidence': float(confidence),
                        'class_id': int(class_id)
                   })
 
-        # Optional: Reset debug print flag occasionally if needed
-        # if self.debug_output_printed: self.debug_output_printed = False
-        # if self.debug_final_printed: self.debug_final_printed = False
-        # if self.nms_debug_printed: self.nms_debug_printed = False
-
-        if len(final_detections) > 0 and not self.debug_final_printed:
-            print(f"Found {len(final_detections)} final detections after NMS.")
-            self.debug_final_printed = True
-        elif np.any(keep) and len(final_detections) == 0 and not self.debug_final_printed:
-            print("All detections suppressed by NMS.")
+        if not self.debug_final_printed: # Print final count once
+            print(f"DEBUG: Returning {len(final_detections)} detections (NMS bypassed).")
             self.debug_final_printed = True
 
         return final_detections
